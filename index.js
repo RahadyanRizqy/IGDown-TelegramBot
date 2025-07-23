@@ -48,7 +48,7 @@ bot.on('text', async (ctx) => {
         return ctx.reply('❌ No valid media found to send.');
       }
 
-      const captionText = `\nThanks for using this bot!\nAdmin: ${ADMIN}`;
+      const captionText = `\nThanks for using this bot!\n\nAdmin: ${ADMIN}`;
       const chunkSize = 10;
 
       for (let i = 0; i < contents.length; i += chunkSize) {
