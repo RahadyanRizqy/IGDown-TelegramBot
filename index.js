@@ -2,13 +2,31 @@ require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const axios = require('axios');
 const PQueue = require('p-queue').default;
+const fs = require('fs');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const queueMap = new Map();
 const ADMIN = process.env.ADMIN;
 const API_ENDPOINT = process.env.API_ENDPOINT;
-
 const isValidUrl = (url) => /^https?:\/\/.+/.test(url);
+
+// Log error ke file error.json
+function logError(url, message) {
+  const path = 'error.json';
+  let current = {};
+
+  if (fs.existsSync(path)) {
+    try {
+      current = JSON.parse(fs.readFileSync(path, 'utf-8'));
+    } catch {
+      current = {};
+    }
+  }
+
+  current[url] = message;
+
+  fs.writeFileSync(path, JSON.stringify(current, null, 2));
+}
 
 bot.command('start', (ctx) => {
   ctx.reply('Send Instagram URL (reel/post).');
@@ -23,7 +41,7 @@ bot.on('text', async (ctx) => {
   }
 
   if (!queueMap.has(userId)) {
-    queueMap.set(userId, new PQueue({ concurrency: 1 }));
+    queueMap.set(userId, new PQueue({ concurrency: 1, interval: 15000, intervalCap: 1 })); // 1 per menit
   }
 
   const queue = queueMap.get(userId);
@@ -31,66 +49,73 @@ bot.on('text', async (ctx) => {
   queue.add(async () => {
     await ctx.reply('⏳ Processing...');
 
-    try {
-      const { data } = await axios.get(API_ENDPOINT, {
-        params: { url, html: 'no' }
-      });
+    let attempt = 0;
+    const maxAttempts = 3;
 
-      const rawContents = data._result?.content;
+    while (attempt < maxAttempts) {
+      try {
+        const { data } = await axios.get(API_ENDPOINT, {
+          params: { url, html: 'no' }
+        });
 
-      if (!rawContents || rawContents.length === 0) {
-        return ctx.reply('⚠️ Content not found or private account.\nIf private, contact admin: ' + ADMIN);
-      }
+        const rawContents = data.result?.content;
+        if (!rawContents || rawContents.length === 0) {
+          throw new Error('No content or private account');
+        }
 
-      // Filter only valid URLs
-      const contents = rawContents.filter(item => isValidUrl(item.mimeUrl));
-      if (contents.length === 0) {
-        return ctx.reply('❌ No valid media found to send.');
-      }
+        const contents = rawContents.filter(item => isValidUrl(item.mimeUrl));
+        if (contents.length === 0) {
+          throw new Error('No valid media found');
+        }
 
-      const captionText = `\nThanks for using this bot!\n\nAdmin: ${ADMIN}`;
-      const chunkSize = 10;
+        const captionText = `\nThanks for using this bot!\n\nAdmin: ${ADMIN}`;
+        const chunkSize = 10;
 
-      for (let i = 0; i < contents.length; i += chunkSize) {
-        const chunk = contents.slice(i, i + chunkSize);
+        for (let i = 0; i < contents.length; i += chunkSize) {
+          const chunk = contents.slice(i, i + chunkSize);
 
-        // Jika hanya satu item di chunk, gunakan method khusus
-        if (chunk.length === 1) {
-          const item = chunk[0];
-          const opts = { caption: captionText, parse_mode: 'Markdown' };
+          if (chunk.length === 1) {
+            const item = chunk[0];
+            const opts = { caption: captionText, parse_mode: 'Markdown' };
 
-          if (item.mimeType === 'video') {
-            await ctx.replyWithVideo(item.mimeUrl, opts);
+            if (item.mimeType === 'video') {
+              await ctx.replyWithVideo(item.mimeUrl, opts);
+            } else {
+              await ctx.replyWithPhoto(item.mimeUrl, opts);
+            }
           } else {
-            await ctx.replyWithPhoto(item.mimeUrl, opts);
-          }
-        } else {
-          // Gunakan mediaGroup
-          const mediaGroup = chunk.map((item, index) => {
-            const isLast = (i + index === contents.length - 1);
-            return {
-              type: item.mimeType === 'video' ? 'video' : 'photo',
-              media: item.mimeUrl,
-              ...(isLast ? {
-                caption: captionText,
-                parse_mode: 'Markdown'
-              } : {})
-            };
-          });
+            const mediaGroup = chunk.map((item, index) => {
+              const isLast = (i + index === contents.length - 1);
+              return {
+                type: item.mimeType === 'video' ? 'video' : 'photo',
+                media: item.mimeUrl,
+                ...(isLast ? { caption: captionText, parse_mode: 'Markdown' } : {})
+              };
+            });
 
-          try {
-            await ctx.replyWithMediaGroup(mediaGroup);
-          } catch (err) {
-            console.error('MediaGroup failed:', err.message);
-            await ctx.reply('⚠️ Failed to send album. Some items might be broken.\n\n' + err.message);
+            try {
+              await ctx.replyWithMediaGroup(mediaGroup);
+            } catch (err) {
+              throw new Error(`MediaGroup failed: ${err.message}`);
+            }
           }
         }
+
+        // ✅ sukses kirim
+        return;
+      } catch (err) {
+        attempt++;
+        console.error(`Attempt ${attempt}:`, err.message);
+
+        if (attempt >= maxAttempts) {
+          ctx.reply('❌ Failed, try again later.');
+          logError(url, err.message);
+          return;
+        }
+
+        await new Promise(res => setTimeout(res, 15000));
       }
-    } catch (err) {
-      console.error('ERROR:', err.message);
-      ctx.reply(`❌ Failed to fetch post. Please check link or report to admin.\n\n*${err.message}*`, {
-        parse_mode: 'Markdown'
-      });
+
     }
   });
 });
